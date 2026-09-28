@@ -1,3 +1,7 @@
+checkout:
+  lfs: false
+  submodules: false
+
 steps:
   - label: ":shield: AICG sandboxed checks"
     timeout_in_minutes: 30
