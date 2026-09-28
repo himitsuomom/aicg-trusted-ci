@@ -1,0 +1,115 @@
+steps:
+  - label: ":shield: AICG sandboxed checks"
+    timeout_in_minutes: 30
+    env:
+      BUILDKITE_CLEAN_CHECKOUT: "true"
+    command: |
+      set -euo pipefail
+
+      source_commit="${BUILDKITE_COMMIT:?missing BUILDKITE_COMMIT}"
+      test "$(git rev-parse HEAD)" = "$source_commit"
+      test "$(git rev-parse "${source_commit}^{tree}")" = "$(git write-tree)"
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        git -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.clean= diff --quiet "$source_commit" -- .
+      test -z "$(git ls-files --others --exclude-standard)"
+
+      check_pinned_file() {
+        path="$1"
+        expected_hash="$2"
+        mode="$(git ls-tree "$source_commit" -- "$path" | awk 'NF {print $1}')"
+        test "$mode" = "100644"
+        actual_hash="$(git show "$source_commit:$path" | sha256sum | cut -d' ' -f1)"
+        test "$actual_hash" = "$expected_hash"
+      }
+
+      check_pinned_file policy.yaml 463cd464924945f6aee922c434c131d3f92d6eb5a147be8f425c35048b479fa9
+      check_pinned_file requirements-dev.lock 126729051a9140794d999a015f08cac215f718233d9368cdb5c654acf7869b7d
+      check_pinned_file requirements.lock f359c00d71cc45aab7ae2b7424abd1f4a794edd8c48b33b01445ddb0a24a73fc
+
+      image="python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9"
+      temp_root="$(mktemp -d)"
+      trap 'rm -rf "$temp_root"' EXIT
+      candidate="$temp_root/candidate"
+      wheelhouse="$temp_root/wheelhouse"
+      mkdir -p "$candidate" "$wheelhouse"
+
+      # Export tracked PR content into a fresh local repo; never expose Buildkite's checkout credentials.
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        git -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.clean= \
+        checkout-index --all --prefix="$candidate/"
+      git -C "$candidate" init -q
+      git -C "$candidate" config user.name "Buildkite sandbox"
+      git -C "$candidate" config user.email "buildkite-sandbox@invalid"
+      git -C "$candidate" add --all --force
+      git -C "$candidate" commit -q -m "isolated candidate snapshot"
+
+      # Fetch only hash-locked binary wheels before running any PR-controlled code.
+      docker run --rm --network bridge \
+        --user "$(id -u):$(id -g)" \
+        --cpus 2 --memory 3g --pids-limit 256 \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --mount "type=bind,src=$candidate/requirements-dev.lock,dst=/requirements-dev.lock,readonly" \
+        --mount "type=bind,src=$wheelhouse,dst=/wheelhouse" \
+        "$image" sh -euc 'python -m pip download --only-binary=:all: --require-hashes --dest /wheelhouse -r /requirements-dev.lock'
+
+      # Audit the immutable runtime lock in a network-enabled container that never sees PR source code.
+      docker run --rm --network bridge \
+        --user "$(id -u):$(id -g)" \
+        --cpus 2 --memory 3g --pids-limit 256 \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --mount "type=bind,src=$candidate/requirements-dev.lock,dst=/requirements-dev.lock,readonly" \
+        --mount "type=bind,src=$candidate/requirements.lock,dst=/requirements.lock,readonly" \
+        --mount "type=bind,src=$wheelhouse,dst=/wheelhouse,readonly" \
+        "$image" sh -euc '
+          python -m venv /tmp/aicg-venv
+          . /tmp/aicg-venv/bin/activate
+          python -m pip install --no-index --find-links /wheelhouse --require-hashes -r /requirements-dev.lock
+          python -m pip_audit -r /requirements.lock --strict --disable-pip --no-deps
+        '
+
+      # PR code gets no network, secrets, host environment, Docker socket, or authenticated .git directory.
+      run_status=0
+      docker run --rm --network none \
+        --user "$(id -u):$(id -g)" \
+        --cpus 2 --memory 3g --pids-limit 256 \
+        --cap-drop ALL --security-opt no-new-privileges \
+        --mount "type=bind,src=$candidate,dst=/workspace" \
+        --mount "type=bind,src=$candidate/policy.yaml,dst=/workspace/policy.yaml,readonly" \
+        --mount "type=bind,src=$candidate/requirements-dev.lock,dst=/workspace/requirements-dev.lock,readonly" \
+        --mount "type=bind,src=$candidate/requirements.lock,dst=/workspace/requirements.lock,readonly" \
+        --mount "type=bind,src=$wheelhouse,dst=/wheelhouse,readonly" \
+        --workdir /workspace \
+        "$image" sh -euc '
+          python -m venv /tmp/aicg-venv
+          . /tmp/aicg-venv/bin/activate
+          python -m pip install --no-index --find-links /wheelhouse --require-hashes -r requirements-dev.lock
+          python -m pip install --no-index --no-deps --no-build-isolation .
+
+          aicg policy validate
+          aicg gate run
+          python examples/scenarios.py
+          aicg gate final
+        ' || run_status=$?
+
+      artifact_status=0
+      if [ -d "$candidate/.ai/evidence" ] && [ ! -L "$candidate/.ai/evidence" ] && [ -d "$candidate/.ai/runs" ] && [ ! -L "$candidate/.ai/runs" ]; then
+        if [ ! -f "$candidate/.ai/evidence/current.json" ] || [ -L "$candidate/.ai/evidence/current.json" ] || ! find "$candidate/.ai/runs" -type f -name summary.json -print -quit | grep -q .; then
+          echo "Required run-bound evidence is missing"
+          artifact_status=1
+        fi
+        artifact_kb="$(du -sk "$candidate/.ai/evidence" "$candidate/.ai/runs" | awk '{total += $1} END {print total + 0}')"
+        if [ "$artifact_kb" -gt 51200 ] || find "$candidate/.ai/evidence" "$candidate/.ai/runs" -type f -size +10M -print -quit | grep -q .; then
+          echo "Refusing oversized candidate evidence artifact"
+          artifact_status=1
+        elif [ "$artifact_status" -eq 0 ]; then
+          (cd "$candidate" && buildkite-agent artifact upload --upload-skip-symlinks ".ai/evidence/**/*" ".ai/runs/**/*") || artifact_status=$?
+        fi
+      else
+        echo "Required evidence directories are missing or symlinked"
+        artifact_status=1
+      fi
+
+      if [ "$run_status" -ne 0 ]; then
+        exit "$run_status"
+      fi
+      exit "$artifact_status"
