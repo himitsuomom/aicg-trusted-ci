@@ -118,7 +118,7 @@ steps:
           echo "Refusing oversized candidate evidence artifact"
           artifact_status=1
         elif [ "$$artifact_status" -eq 0 ]; then
-          (cd "$$candidate" && buildkite-agent artifact upload --upload-skip-symlinks ".ai/evidence/**/*" ".ai/runs/**/*") || artifact_status=$$?
+          (cd "$$candidate" && buildkite-agent artifact upload --upload-skip-symlinks ".ai/evidence/**/*" && buildkite-agent artifact upload --upload-skip-symlinks ".ai/runs/**/*") || artifact_status=$$?
         fi
       else
         echo "Required evidence directories are missing or symlinked"
