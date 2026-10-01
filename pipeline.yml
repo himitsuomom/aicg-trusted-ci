@@ -10,6 +10,8 @@ steps:
   - label: ":shield: AICG sandboxed checks"
     key: aicg-sandboxed-checks
     timeout_in_minutes: 30
+    agents:
+      queue: linux-small
     env:
       BUILDKITE_CLEAN_CHECKOUT: "true"
     command: |
@@ -144,28 +146,14 @@ steps:
       fi
       exit "$$artifact_status"
 
-  - label: ":mag: Authenticated Semantic Verifier"
-    key: aicg-semantic-verifier
+  - trigger: aicg-semantic-verifier
+    label: ":mag: Authenticated Semantic Verifier"
     if: build.pull_request.id != null && build.env("AICG_VERIFIER_ENABLED") == "true"
     depends_on: aicg-sandboxed-checks
-    timeout_in_minutes: 30
-    agents:
-      queue: aicg-verifier
-    notify:
-      - github_commit_status:
-          context: buildkite/aicg-semantic-verifier/pr
-        if: build.pull_request.id != null && build.env("AICG_VERIFIER_ENABLED") == "true"
-    command: |
-      set -euo pipefail
-      trusted_commit="19fc704da933c767d9a45eb16f3f1fb041fc1c17"
-      trusted_root="$$(mktemp -d "$${TMPDIR:-/tmp}/aicg-trusted-ci.XXXXXX")"
-      trap 'rm -rf "$$trusted_root"' EXIT
-      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$$trusted_root" init -q
-      git -C "$$trusted_root" remote add origin https://github.com/himitsuomom/aicg-trusted-ci.git
-      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-        git -C "$$trusted_root" -c credential.helper= -c core.askPass=/bin/false \
-        fetch --depth=1 origin "$$trusted_commit"
-      test "$$(git -C "$$trusted_root" rev-parse FETCH_HEAD)" = "$$trusted_commit"
-      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-        git -C "$$trusted_root" archive --format=tar FETCH_HEAD | tar -xf - -C "$$trusted_root"
-      "$$trusted_root/scripts/run-semantic-verifier.sh"
+    build:
+      commit: "${BUILDKITE_COMMIT}"
+      message: "Authenticated Semantic Verifier"
+      env:
+        AICG_PARENT_PULL_REQUEST: "${BUILDKITE_PULL_REQUEST}"
+        AICG_PARENT_PR_BASE_BRANCH: "${BUILDKITE_PULL_REQUEST_BASE_BRANCH}"
+        AICG_VERIFIER_ENABLED: "true"

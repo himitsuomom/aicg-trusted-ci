@@ -13,10 +13,32 @@ ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "run_trusted_aicg.py"
 POLICY_CHECK = ROOT / "scripts" / "check_verifier_policy.py"
 RUNNER = ROOT / "scripts" / "run-semantic-verifier.sh"
-PIPELINE = ROOT / "pipeline.yml"
+PARENT_PIPELINE = ROOT / "pipeline.yml"
+VERIFIER_PIPELINE = ROOT / "verifier-pipeline.yml"
 
 
 class TrustedRunnerIsolationTest(unittest.TestCase):
+    def test_runner_rejects_direct_execution_before_buildkite_work(self):
+        environment = os.environ.copy()
+        for name in (
+            "BUILDKITE_PIPELINE_SLUG",
+            "BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG",
+            "BUILDKITE_TRIGGERED_FROM_BUILD_ID",
+        ):
+            environment.pop(name, None)
+
+        result = subprocess.run(
+            ["bash", str(RUNNER)],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Semantic Verifier must run in its dedicated pipeline", result.stderr)
+
     def test_candidate_module_cannot_shadow_pinned_aicg_package(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -75,13 +97,26 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
         self.assertIn('repo="${BUILDKITE_REPO:-}"', runner)
         self.assertIn('readonly TRUSTED_AICG_COMMIT=', runner)
         self.assertNotIn("pip install .", runner)
+        self.assertIn('BUILDKITE_PIPELINE_SLUG:-}', runner)
+        self.assertIn('BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG:-}', runner)
+        self.assertIn('refs/pull/${AICG_PARENT_PULL_REQUEST}/head', runner)
+        self.assertIn('--build "$BUILDKITE_TRIGGERED_FROM_BUILD_ID" --step aicg-sandboxed-checks', runner)
 
-        pipeline = PIPELINE.read_text()
-        self.assertIn('AICG_VERIFIER_ENABLED: "false"', pipeline)
-        self.assertIn('queue: aicg-verifier', pipeline)
-        self.assertIn('depends_on: aicg-sandboxed-checks', pipeline)
-        self.assertIn('context: buildkite/aicg-semantic-verifier/pr', pipeline)
-        self.assertIn('build.pull_request.id != null && build.env("AICG_VERIFIER_ENABLED") == "true"', pipeline)
+        parent = PARENT_PIPELINE.read_text()
+        self.assertIn('AICG_VERIFIER_ENABLED: "false"', parent)
+        self.assertIn('queue: linux-small', parent)
+        self.assertIn('trigger: aicg-semantic-verifier', parent)
+        self.assertIn('depends_on: aicg-sandboxed-checks', parent)
+        self.assertIn('build.pull_request.id != null && build.env("AICG_VERIFIER_ENABLED") == "true"', parent)
+        self.assertNotIn("buildkite-agent secret get", parent)
+
+        verifier = VERIFIER_PIPELINE.read_text()
+        self.assertIn('checkout:\n  skip: true', verifier)
+        self.assertIn('queue: linux-small', verifier)
+        self.assertIn('build.source == "trigger_job"', verifier)
+        self.assertIn('BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG', verifier)
+        self.assertIn('context: buildkite/aicg-semantic-verifier/pr', verifier)
+        self.assertRegex(verifier, r'trusted_commit="[0-9a-f]{40}"')
 
 
 if __name__ == "__main__":
