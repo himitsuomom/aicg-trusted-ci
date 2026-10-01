@@ -88,6 +88,7 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
 
     def test_secret_access_follows_pinned_runtime_and_artifact_validation(self):
         runner = RUNNER.read_text()
+        self.assertIn("du --apparent-size -sk", runner)
         self.assertLess(runner.index("docker build --tag"), runner.index("buildkite-agent secret get"))
         self.assertLess(runner.index("run_trusted check_verifier_policy.py"), runner.index("buildkite-agent secret get"))
         self.assertLess(
@@ -117,6 +118,41 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
         self.assertIn('BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG', verifier)
         self.assertIn('context: buildkite/aicg-semantic-verifier/pr', verifier)
         self.assertRegex(verifier, r'trusted_commit="[0-9a-f]{40}"')
+
+    def test_artifact_cap_counts_sparse_file_contents(self):
+        parent = PARENT_PIPELINE.read_text()
+        runner = RUNNER.read_text()
+        self.assertIn("du --apparent-size -sk", parent)
+        self.assertIn("du --apparent-size -sk", runner)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            roots = [Path(temporary) / "evidence", Path(temporary) / "runs"]
+            for root in roots:
+                root.mkdir()
+            for index in range(6):
+                sparse_file = roots[index % len(roots)] / f"evidence-{index}.json"
+                sparse_file.touch()
+                with sparse_file.open("r+b") as stream:
+                    stream.truncate(9 * 1024 * 1024)
+
+            files = [path for root in roots for path in root.iterdir()]
+            self.assertGreater(sum(path.stat().st_size for path in files), 50 * 1024 * 1024)
+            self.assertLessEqual(max(path.stat().st_size for path in files), 10 * 1024 * 1024)
+
+            allocated = sum(getattr(path.stat(), "st_blocks", 0) * 512 for path in files)
+            if allocated >= 50 * 1024 * 1024:
+                self.skipTest("filesystem does not preserve sparse-file allocation")
+
+            result = subprocess.run(
+                ["du", "--apparent-size", "-sk", *(str(root) for root in roots)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                self.skipTest("du does not support GNU --apparent-size on this host")
+            apparent_kib = sum(int(line.split()[0]) for line in result.stdout.splitlines())
+            self.assertGreater(apparent_kib, 51200)
 
 
 if __name__ == "__main__":

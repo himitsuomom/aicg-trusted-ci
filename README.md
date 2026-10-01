@@ -4,7 +4,7 @@ This public repository stores the trusted Buildkite dashboard YAML and isolated 
 
 ## What the check means
 
-The dashboard YAML validates the Buildkite checkout SHA, pins the target policy and dependency lockfiles by SHA-256, downloads only hash-locked binary dependencies, audits the runtime lock in a networked container that never receives PR source, and runs the target's configured checks in an isolated container with network disabled. The PR container receives no host environment, Buildkite credentials, GitHub credentials, Docker socket, or authenticated `.git` directory. It runs on an ephemeral Buildkite-hosted Linux agent, with CPU, memory, process, and time limits. Host-side artifact upload skips symlinks and refuses individual evidence files larger than 10 MB.
+The dashboard YAML validates the Buildkite checkout SHA, pins the target policy and dependency lockfiles by SHA-256, downloads only hash-locked binary dependencies, audits the runtime lock in a networked container that never receives PR source, and runs the target's configured checks in an isolated container with network disabled. The PR container receives no host environment, Buildkite credentials, GitHub credentials, Docker socket, or authenticated `.git` directory. It runs on an ephemeral Buildkite-hosted Linux agent, with CPU, memory, process, and time limits. Host-side artifact upload skips symlinks, refuses individual evidence files larger than 10 MiB, and caps the combined apparent size at 50 MiB.
 
 The mechanical step protects CI credentials from ordinary malicious PR code. The target's application, CLI, test suite, and evidence are still PR-controlled; a green mechanical run cannot prove code benign.
 

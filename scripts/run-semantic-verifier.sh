@@ -106,7 +106,7 @@ find "$artifacts/.ai/evidence" "$artifacts/.ai/runs" -type l -print -quit | grep
   && die "symlinked evidence artifacts are not allowed"
 find "$artifacts/.ai/runs" -type f -name summary.json -print -quit | grep -q . \
   || die "missing run summary artifact"
-artifact_kb="$(du -sk "$artifacts/.ai/evidence" "$artifacts/.ai/runs" | awk '{total += $1} END {print total + 0}')"
+artifact_kb="$(du --apparent-size -sk "$artifacts/.ai/evidence" "$artifacts/.ai/runs" | awk '{total += $1} END {print total + 0}')"
 [[ "$artifact_kb" -le 51200 ]] || die "evidence artifacts exceed the 50 MiB limit"
 find "$artifacts/.ai/evidence" "$artifacts/.ai/runs" -type f -size +10M -print -quit | grep -q . \
   && die "evidence artifact exceeds the 10 MiB per-file limit"
