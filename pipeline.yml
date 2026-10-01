@@ -27,8 +27,8 @@ steps:
       }
 
       check_pinned_file policy.yaml 463cd464924945f6aee922c434c131d3f92d6eb5a147be8f425c35048b479fa9
-      check_pinned_file requirements-dev.lock 126729051a9140794d999a015f08cac215f718233d9368cdb5c654acf7869b7d
-      check_pinned_file requirements.lock f359c00d71cc45aab7ae2b7424abd1f4a794edd8c48b33b01445ddb0a24a73fc
+      check_pinned_file requirements-dev.lock 6841b1660d2eb6e9c6b8f5713414d06452b9c8862fcdd59f07e53d6dab9fce61
+      check_pinned_file requirements.lock 4036f3896dc8b37f9ef1cb7023c393cf01cc243e3b6bce675641e850b3d3e8d1
 
       image="python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9"
       runtime_image="aicg-ci:$${BUILDKITE_BUILD_ID}"

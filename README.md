@@ -1,6 +1,6 @@
 # AICG trusted CI
 
-This public repository stores the Buildkite pipeline definition for `himitsuomom/ai-coding-governance-platform`. The target pull request cannot change the pipeline that publishes its status. This configuration is prepared but is **not active** until installed in Buildkite and required by the target repository's protected `main` rule.
+This public repository stores the trusted Buildkite dashboard YAML for `himitsuomom/ai-coding-governance-platform`. The mechanical `aicg-trusted-gate` check is active and required by protected `main` alongside GitHub Actions. It does not issue Semantic Verifier reports or receive model/signing secrets; the isolated authenticated verifier step is still pending.
 
 ## What the check means
 
