@@ -88,7 +88,7 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
 
     def test_secret_access_follows_pinned_runtime_and_artifact_validation(self):
         runner = RUNNER.read_text()
-        self.assertIn("du --apparent-size -sk", runner)
+        self.assertIn("du --apparent-size --count-links -sk", runner)
         self.assertLess(runner.index("docker build --tag"), runner.index("buildkite-agent secret get"))
         self.assertLess(runner.index("run_trusted check_verifier_policy.py"), runner.index("buildkite-agent secret get"))
         self.assertLess(
@@ -122,8 +122,10 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
     def test_artifact_cap_counts_sparse_file_contents(self):
         parent = PARENT_PIPELINE.read_text()
         runner = RUNNER.read_text()
-        self.assertIn("du --apparent-size -sk", parent)
-        self.assertIn("du --apparent-size -sk", runner)
+        self.assertIn("du --apparent-size --count-links -sk", parent)
+        self.assertIn("du --apparent-size --count-links -sk", runner)
+        self.assertIn('if [ "$$artifact_kb" -gt 51200 ]', parent)
+        self.assertIn('[[ "$artifact_kb" -le 51200 ]]', runner)
 
         with tempfile.TemporaryDirectory() as temporary:
             roots = [Path(temporary) / "evidence", Path(temporary) / "runs"]
@@ -153,6 +155,37 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
                 self.skipTest("du does not support GNU --apparent-size on this host")
             apparent_kib = sum(int(line.split()[0]) for line in result.stdout.splitlines())
             self.assertGreater(apparent_kib, 51200)
+
+    def test_artifact_cap_counts_hardlink_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            roots = [Path(temporary) / "evidence", Path(temporary) / "runs"]
+            for root in roots:
+                root.mkdir()
+            source = roots[0] / "source.json"
+            with source.open("wb") as stream:
+                stream.truncate(9 * 1024 * 1024)
+            for index in range(6):
+                os.link(source, roots[index % len(roots)] / f"copy-{index}.json")
+
+            common = ["du", "--apparent-size", "-sk", *(str(root) for root in roots)]
+            counted = subprocess.run(
+                ["du", "--apparent-size", "--count-links", "-sk", *(str(root) for root in roots)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if counted.returncode != 0:
+                self.skipTest("du does not support GNU --count-links on this host")
+            deduplicated = subprocess.run(
+                common,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            deduplicated_kib = sum(int(line.split()[0]) for line in deduplicated.stdout.splitlines())
+            counted_kib = sum(int(line.split()[0]) for line in counted.stdout.splitlines())
+            self.assertLessEqual(deduplicated_kib, 51200)
+            self.assertGreater(counted_kib, 51200)
 
 
 if __name__ == "__main__":
