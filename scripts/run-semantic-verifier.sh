@@ -14,9 +14,17 @@ die() {
   exit 1
 }
 
-[[ "${AICG_VERIFIER_ENABLED:-false}" == "true" ]] || die "AICG_VERIFIER_ENABLED must be true in protected Buildkite settings"
-[[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]] || die "Semantic Verifier only runs for pull requests"
-[[ "${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}" == "main" ]] || die "Semantic Verifier only accepts pull requests targeting main"
+[[ "${BUILDKITE_PIPELINE_SLUG:-}" == "aicg-semantic-verifier" ]] \
+  || die "Semantic Verifier must run in its dedicated pipeline"
+[[ "${BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG:-}" == "aicg-trusted-gate" ]] \
+  || die "Semantic Verifier must be triggered by the trusted mechanical pipeline"
+[[ "${BUILDKITE_TRIGGERED_FROM_BUILD_ID:-}" =~ ^[a-f0-9-]{36}$ ]] \
+  || die "Semantic Verifier requires a parent Buildkite build"
+[[ "${AICG_VERIFIER_ENABLED:-false}" == "true" ]] || die "AICG_VERIFIER_ENABLED must be true"
+[[ "${AICG_PARENT_PULL_REQUEST:-}" =~ ^[1-9][0-9]*$ ]] \
+  || die "Semantic Verifier only runs for pull requests"
+[[ "${AICG_PARENT_PR_BASE_BRANCH:-}" == "main" ]] \
+  || die "Semantic Verifier only accepts pull requests targeting main"
 
 repo="${BUILDKITE_REPO:-}"
 repo="${repo#git://github.com/}"
@@ -28,27 +36,33 @@ repo="${repo%.git}"
 [[ "$repo" == "$TARGET_REPO" ]] || die "Semantic Verifier rejected an unexpected Buildkite pipeline repository"
 
 source_commit="${BUILDKITE_COMMIT:?missing BUILDKITE_COMMIT}"
-[[ "$(git rev-parse HEAD)" == "$source_commit" ]] || die "checkout does not match BUILDKITE_COMMIT"
-[[ "$(git rev-parse "${source_commit}^{tree}")" == "$(git write-tree)" ]] || die "checkout contains tracked changes"
-GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-  git -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.clean= diff --quiet "$source_commit" -- . \
-  || die "checkout contains worktree changes"
-[[ -z "$(git ls-files --others --exclude-standard)" ]] || die "checkout contains untracked files"
+[[ "$source_commit" =~ ^[a-f0-9]{40}$ ]] || die "invalid Buildkite source commit"
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/aicg-verifier.XXXXXX")"
+image="aicg-semantic:${BUILDKITE_BUILD_ID:-local}"
+trap 'docker image rm -f "$image" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+
+source_git="$tmp/source-git"
+mkdir -p "$source_git"
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$source_git" init -q
+git -C "$source_git" remote add origin "https://github.com/${TARGET_REPO}.git"
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  git -C "$source_git" -c credential.helper= -c core.askPass=/bin/false \
+  fetch --no-tags --depth=1 origin \
+  "refs/pull/${AICG_PARENT_PULL_REQUEST}/head:refs/remotes/origin/aicg-pr"
+[[ "$(git -C "$source_git" rev-parse refs/remotes/origin/aicg-pr)" == "$source_commit" ]] \
+  || die "pull request head changed after the parent mechanical build"
 
 check_pinned_file() {
   local path="$1" expected="$2" mode actual
-  mode="$(git ls-tree "$source_commit" -- "$path" | awk 'NF {print $1}')"
+  mode="$(git -C "$source_git" ls-tree "$source_commit" -- "$path" | awk 'NF {print $1}')"
   [[ "$mode" == "100644" ]] || die "unexpected file mode for $path"
-  actual="$(git show "$source_commit:$path" | sha256sum | cut -d' ' -f1)"
+  actual="$(git -C "$source_git" show "$source_commit:$path" | sha256sum | cut -d' ' -f1)"
   [[ "$actual" == "$expected" ]] || die "protected SHA-256 mismatch for $path"
 }
 
 check_pinned_file policy.yaml "$POLICY_SHA256"
 check_pinned_file requirements.lock "$REQUIREMENTS_SHA256"
-
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/aicg-verifier.XXXXXX")"
-image="aicg-semantic:${BUILDKITE_BUILD_ID:-local}"
-trap 'docker image rm -f "$image" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
 
 candidate="$tmp/candidate"
 artifacts="$tmp/artifacts"
@@ -58,9 +72,9 @@ image_context="$tmp/image-context"
 mkdir -p "$candidate" "$artifacts" "$trusted_git" "$trusted_app" \
   "$image_context/trusted/aicg/src" "$image_context/trusted/scripts"
 
-# Copy PR files as inert data and create isolated Git metadata without candidate hooks.
+# Copy the pinned PR commit as inert data; the child pipeline skipped checkout so repository hooks never ran.
 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-  git -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.clean= \
+  git -C "$source_git" -c filter.lfs.process= -c filter.lfs.smudge= -c filter.lfs.clean= \
   archive --format=tar "$source_commit" | tar -xf - -C "$candidate"
 [[ ! -L "$candidate/.ai" && ( ! -e "$candidate/.ai" || -d "$candidate/.ai" ) ]] \
   || die "source snapshot has an unsafe .ai path"
@@ -79,8 +93,10 @@ git -C "$candidate" -c core.hooksPath=/dev/null commit -q -m "isolated PR data s
 # Download artifacts into a separate directory so PR-controlled symlinks cannot redirect writes.
 (
   cd "$artifacts"
-  buildkite-agent artifact download ".ai/evidence/**/*" .
-  buildkite-agent artifact download ".ai/runs/**/*" .
+  buildkite-agent artifact download ".ai/evidence/**/*" . \
+    --build "$BUILDKITE_TRIGGERED_FROM_BUILD_ID" --step aicg-sandboxed-checks
+  buildkite-agent artifact download ".ai/runs/**/*" . \
+    --build "$BUILDKITE_TRIGGERED_FROM_BUILD_ID" --step aicg-sandboxed-checks
 )
 [[ -d "$artifacts/.ai/evidence" && ! -L "$artifacts/.ai/evidence" ]] || die "missing or symlinked evidence directory"
 [[ -d "$artifacts/.ai/runs" && ! -L "$artifacts/.ai/runs" ]] || die "missing or symlinked run directory"
