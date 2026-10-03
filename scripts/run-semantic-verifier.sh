@@ -40,7 +40,18 @@ source_commit="${BUILDKITE_COMMIT:?missing BUILDKITE_COMMIT}"
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/aicg-verifier.XXXXXX")"
 image="aicg-semantic:${BUILDKITE_BUILD_ID:-local}"
-trap 'docker image rm -f "$image" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+build_suffix="$(printf '%s' "${BUILDKITE_BUILD_ID:-local}" | tr -cd 'a-zA-Z0-9_-')"
+[[ -n "$build_suffix" ]] || die "invalid Buildkite build ID for isolated verifier network"
+verifier_network="aicg-verifier-internal-${build_suffix}"
+proxy_container="aicg-verifier-proxy-${build_suffix}"
+cleanup() {
+  unset CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN AICG_VERIFIER_PRIVATE_KEY
+  docker rm -f "$proxy_container" >/dev/null 2>&1 || true
+  docker network rm "$verifier_network" >/dev/null 2>&1 || true
+  docker image rm -f "$image" >/dev/null 2>&1 || true
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 source_git="$tmp/source-git"
 mkdir -p "$source_git"
@@ -104,6 +115,8 @@ git -C "$candidate" -c core.hooksPath=/dev/null commit -q -m "isolated PR data s
   || die "missing or symlinked current evidence binding"
 find "$artifacts/.ai/evidence" "$artifacts/.ai/runs" -type l -print -quit | grep -q . \
   && die "symlinked evidence artifacts are not allowed"
+artifact_files="$(find "$artifacts/.ai/evidence" "$artifacts/.ai/runs" -type f -printf . | wc -c | tr -d '[:space:]')"
+[[ "$artifact_files" -le 4096 ]] || die "evidence artifacts contain more than 4096 files"
 find "$artifacts/.ai/runs" -type f -name summary.json -print -quit | grep -q . \
   || die "missing run summary artifact"
 artifact_kb="$(du --apparent-size --count-links -sk "$artifacts/.ai/evidence" "$artifacts/.ai/runs" | awk '{total += $1} END {print total + 0}')"
@@ -129,6 +142,7 @@ find "$trusted_app/src/aicg" -type l -print -quit | grep -q . \
 cp -R "$trusted_app/src/aicg" "$image_context/trusted/aicg/src/"
 cp "$(dirname -- "${BASH_SOURCE[0]}")/run_trusted_aicg.py" "$image_context/trusted/scripts/"
 cp "$(dirname -- "${BASH_SOURCE[0]}")/check_verifier_policy.py" "$image_context/trusted/scripts/"
+cp "$(dirname -- "${BASH_SOURCE[0]}")/cloudflare_connect_proxy.py" "$image_context/trusted/scripts/"
 cp "$candidate/requirements.lock" "$image_context/requirements.lock"
 cat > "$image_context/Dockerfile" <<EOF
 FROM ${PYTHON_IMAGE}
@@ -137,6 +151,7 @@ RUN python -m pip install --disable-pip-version-check --no-cache-dir --require-h
 COPY trusted/aicg/src/aicg /opt/trusted/aicg/src/aicg
 COPY trusted/scripts/run_trusted_aicg.py /opt/trusted/scripts/run_trusted_aicg.py
 COPY trusted/scripts/check_verifier_policy.py /opt/trusted/scripts/check_verifier_policy.py
+COPY trusted/scripts/cloudflare_connect_proxy.py /opt/trusted/scripts/cloudflare_connect_proxy.py
 EOF
 docker build --tag "$image" "$image_context"
 
@@ -152,6 +167,38 @@ run_trusted() {
 # Reject unconfigured policy before asking Buildkite for any credential.
 run_trusted check_verifier_policy.py
 
+# The verifier container has no direct network route. A credential-free sidecar
+# can open TLS tunnels only to api.cloudflare.com:443.
+docker network create --internal "$verifier_network" >/dev/null
+docker run --detach --name "$proxy_container" --network bridge \
+  --user "$(id -u):$(id -g)" --cpus 0.25 --memory 128m --pids-limit 64 \
+  --cap-drop ALL --security-opt no-new-privileges --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  "$image" python -I /opt/trusted/scripts/cloudflare_connect_proxy.py >/dev/null
+docker network connect --alias aicg-cloudflare-proxy "$verifier_network" "$proxy_container"
+
+proxy_ready=false
+for attempt in {1..30}; do
+  if docker run --rm --network "$verifier_network" "$image" python -I -c \
+      'import socket; socket.create_connection(("aicg-cloudflare-proxy", 3128), timeout=1).close()' \
+      >/dev/null 2>&1; then
+    proxy_ready=true
+    break
+  fi
+  sleep 1
+done
+[[ "$proxy_ready" == "true" ]] || die "Cloudflare egress proxy did not become ready"
+
+# Prove the verifier network cannot bypass the allowlisted proxy with a direct connection.
+docker run --rm --network "$verifier_network" "$image" python -I -c '
+import socket
+try:
+    socket.create_connection(("1.1.1.1", 443), timeout=3)
+except OSError:
+    raise SystemExit(0)
+raise SystemExit("direct verifier egress is unexpectedly available")
+'
+
 for key in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN AICG_VERIFIER_PRIVATE_KEY; do
   value="$(buildkite-agent secret get "$key")"
   [[ -n "$value" ]] || die "required Buildkite secret is empty: $key"
@@ -159,13 +206,24 @@ for key in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN AICG_VERIFIER_PRIVATE_KEY;
   unset value
 done
 
-docker run --rm --network bridge \
+verifier_status=0
+docker run --rm --network "$verifier_network" \
   --user "$(id -u):$(id -g)" --cpus 2 --memory 3g --pids-limit 256 \
   --cap-drop ALL --security-opt no-new-privileges --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --env HTTPS_PROXY=http://aicg-cloudflare-proxy:3128 \
+  --env https_proxy=http://aicg-cloudflare-proxy:3128 \
+  --env NO_PROXY= --env no_proxy= \
   --env CLOUDFLARE_ACCOUNT_ID --env CLOUDFLARE_API_TOKEN --env AICG_VERIFIER_PRIVATE_KEY \
   --mount "type=bind,src=$candidate,dst=/workspace" --workdir /workspace \
-  "$image" python -I /opt/trusted/scripts/run_trusted_aicg.py verifier run
+  "$image" python -I /opt/trusted/scripts/run_trusted_aicg.py verifier run \
+  || verifier_status=$?
+
+# Do not expose verifier credentials to artifact upload, final-gate, or EXIT-trap subprocesses.
+unset CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN AICG_VERIFIER_PRIVATE_KEY
+if [[ "$verifier_status" -ne 0 ]]; then
+  exit "$verifier_status"
+fi
 
 (
   cd "$candidate"

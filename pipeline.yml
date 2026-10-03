@@ -129,6 +129,11 @@ steps:
           echo "Required run-bound evidence is missing"
           artifact_status=1
         fi
+        artifact_files="$$(find "$$candidate/.ai/evidence" "$$candidate/.ai/runs" -type f -printf . | wc -c | tr -d '[:space:]')"
+        if [ "$$artifact_files" -gt 4096 ]; then
+          echo "Refusing evidence artifact with more than 4096 files"
+          artifact_status=1
+        fi
         artifact_kb="$$(du --apparent-size --count-links -sk "$$candidate/.ai/evidence" "$$candidate/.ai/runs" | awk '{total += $$1} END {print total + 0}')"
         if [ "$$artifact_kb" -gt 51200 ] || find "$$candidate/.ai/evidence" "$$candidate/.ai/runs" -type f -size +10M -print -quit | grep -q .; then
           echo "Refusing oversized candidate evidence artifact"

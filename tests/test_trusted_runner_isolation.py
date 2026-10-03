@@ -1,13 +1,12 @@
 """The trusted AICG wrapper must not import candidate modules from its working directory."""
 
-from pathlib import Path
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "run_trusted_aicg.py"
@@ -118,6 +117,40 @@ class TrustedRunnerIsolationTest(unittest.TestCase):
         self.assertIn('BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG', verifier)
         self.assertIn('context: buildkite/aicg-semantic-verifier/pr', verifier)
         self.assertRegex(verifier, r'trusted_commit="[0-9a-f]{40}"')
+
+    def test_verifier_secrets_are_unset_before_later_host_subprocesses(self):
+        runner = RUNNER.read_text()
+        verifier_run = runner.index('docker run --rm --network "$verifier_network"')
+        verifier_run_end = runner.index(
+            '"$image" python -I /opt/trusted/scripts/run_trusted_aicg.py verifier run',
+            verifier_run,
+        )
+        failure_capture = runner.index("|| verifier_status=$?", verifier_run_end)
+        secret_unset = runner.index(
+            "unset CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN AICG_VERIFIER_PRIVATE_KEY",
+            failure_capture,
+        )
+        failure_exit = runner.index('exit "$verifier_status"', secret_unset)
+        artifact_upload = runner.index("buildkite-agent artifact upload", secret_unset)
+        final_gate = runner.index("run_trusted run_trusted_aicg.py gate final", secret_unset)
+
+        self.assertLess(verifier_run, verifier_run_end)
+        self.assertLess(verifier_run_end, failure_capture)
+        self.assertLess(failure_capture, secret_unset)
+        self.assertLess(secret_unset, failure_exit)
+        self.assertLess(secret_unset, artifact_upload)
+        self.assertLess(secret_unset, final_gate)
+
+    def test_exit_cleanup_unsets_partial_secrets_before_host_subprocesses(self):
+        runner = RUNNER.read_text()
+        cleanup_start = runner.index("cleanup() {")
+        cleanup_end = runner.index("\n}", cleanup_start)
+        cleanup = runner[cleanup_start:cleanup_end]
+        secret_unset = cleanup.index(
+            "unset CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN AICG_VERIFIER_PRIVATE_KEY"
+        )
+        docker_cleanup = cleanup.index("docker rm -f")
+        self.assertLess(secret_unset, docker_cleanup)
 
     def test_artifact_cap_counts_sparse_file_contents(self):
         parent = PARENT_PIPELINE.read_text()
