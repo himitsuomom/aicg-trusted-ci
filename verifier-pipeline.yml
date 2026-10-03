@@ -14,7 +14,7 @@ steps:
         if: build.source == "trigger_job" && build.env("BUILDKITE_TRIGGERED_FROM_BUILD_PIPELINE_SLUG") == "aicg-trusted-gate" && build.env("AICG_VERIFIER_ENABLED") == "true"
     command: |
       set -euo pipefail
-      trusted_commit="2c11999d8e48c5ce08a0ee4afce3330256b298e0"
+      trusted_commit="2570155ce96e213a0a3afac4cfcd9b3d039608b8"
       trusted_root="$$(mktemp -d "$${TMPDIR:-/tmp}/aicg-trusted-ci.XXXXXX")"
       trap 'rm -rf "$$trusted_root"' EXIT
       GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$$trusted_root" init -q
